@@ -1,0 +1,87 @@
+--- a/sparse_mla_sm120_decode_dsv4.cu
++++ b/sparse_mla_sm120_decode_dsv4.cu
+@@ -170,6 +170,8 @@
+   DSV4_DISPATCH(32, 256)
+   DSV4_DISPATCH(32, 512)
+   DSV4_DISPATCH(32, 1024)
++  DSV4_DISPATCH(32, 1152)
++  DSV4_DISPATCH(32, 640)
+   DSV4_DISPATCH(64, 128)
+   DSV4_DISPATCH(64, 192)
+   DSV4_DISPATCH(64, 256)
+--- a/sparse_mla_sm120_prefill.cu
++++ b/sparse_mla_sm120_prefill.cu
+@@ -306,6 +306,10 @@
+     DISPATCH_BY_NH_CM(FP8, 1024);
+   else if (topk == 2048)
+     DISPATCH_BY_NH_CM(FP8, 2048);
++  else if (topk == 1152)
++    DISPATCH_BY_NH_CM(FP8, 1152);
++  else if (topk == 640)
++    DISPATCH_BY_NH_CM(FP8, 640);
+   else
+     return false;
+ 
+@@ -391,13 +395,46 @@
+     }                                                 \
+   } while (0)
+ 
+-  if (topk != 128) return false;
++  if (topk == 128) {
++    if (extra_page_block_size == 64) {
++      DISPATCH_BY_NH_PBSX(64);
++    } else if (extra_page_block_size == 2) {
++      DISPATCH_BY_NH_PBSX(2);
++    }
++    return false;
++  }
++
++// DSV4.1 mixes compress ratios 1 and 2, which makes the main index wider
++// than any DSV4.0 shape: 640 at ratio 1, 1152 at ratio 2. Same kernel,
++// longer K loop, so only the template argument changes.
++#define DISPATCH_BY_NH_PBSX_TK(TK, PBSX)              \
++  do {                                                \
++    switch (num_heads) {                              \
++      case 8:                                         \
++        DISPATCH_DUAL_MG_CM(FP8, 8, TK, PBSX, 1);     \
++        return true;                                  \
++      case 16:                                        \
++        DISPATCH_DUAL_MG_CM(FP8, 16, TK, PBSX, 1);    \
++        return true;                                  \
++      case 32:                                        \
++        DISPATCH_DUAL_MG_CM(FP8, 32, TK, PBSX, 2);    \
++        return true;                                  \
++      case 64:                                        \
++        DISPATCH_DUAL_MG_CM(FP8, 64, TK, PBSX, 2);    \
++        return true;                                  \
++      case 128:                                       \
++        DISPATCH_DUAL_MG_CM(FP8, 128, TK, PBSX, 2);   \
++        return true;                                  \
++      default:                                        \
++        return false;                                 \
++    }                                                 \
++  } while (0)
+   if (extra_page_block_size == 64) {
+-    DISPATCH_BY_NH_PBSX(64);
+-  } else if (extra_page_block_size == 2) {
+-    DISPATCH_BY_NH_PBSX(2);
++    if (topk == 1152) DISPATCH_BY_NH_PBSX_TK(1152, 64);
++    if (topk == 640) DISPATCH_BY_NH_PBSX_TK(640, 64);
+   }
+   return false;
++#undef DISPATCH_BY_NH_PBSX_TK
+ #undef DISPATCH_BY_NH_PBSX
+ #undef DISPATCH_DUAL_MG_CM
+ }
+--- a/_sparse_mla_sm120.py
++++ b/_sparse_mla_sm120.py
+@@ -91,7 +91,9 @@
+         (32, 192),
+         (32, 256),
+         (32, 512),
++        (32, 640),
+         (32, 1024),
++        (32, 1152),
+         (64, 128),
+         (64, 192),
+         (64, 256),
