@@ -29,26 +29,68 @@ instead — it is faster *and* lossless. This repo exists for people who have tw
 
 ## Measured performance
 
-Single stream, 256 tokens forced (`min_tokens` + `ignore_eos`), median of repeated runs,
-REAP-256E at TP=2:
+**Throughput is workload-dependent, and by a factor of three.** Quoting one number for
+this lane is misleading, so here is the spread. Single stream (c=1), 600 tokens per case,
+greedy drafting, DSpark k=5, eager, REAP-256E at TP=2, 32K context:
 
-| config | decode c=1 | KV pool | notes |
+| workload | decode c=1 | mean acceptance length (max 6) |
+|---|---:|---:|
+| counting ("1 to 220") | **49.4 tok/s** | 5.90–6.00 |
+| code generation | **30.4 tok/s** | 3.26–4.51 |
+| reasoning (word problem) | 28.3 tok/s | 3.13–3.81 |
+| chat / explanation | 27.0 tok/s | 3.23–3.59 |
+| prose (400-word essay) | **19.2 tok/s** | 2.24–2.49 |
+
+⚠️ **Do not benchmark this lane on counting prompts.** A degenerate sequence lets the
+drafter accept every token (6.00 of 6, the k=5 ceiling) and reads ~2.6× the honest rate.
+Earlier revisions of this file quoted **16.7 tok/s at acceptance 2.18–2.44**; that number
+is reproducible, but it is the *prose* case specifically, not the lane's general speed.
+Judge by code/chat/prose, and always report which.
+
+Prefill measures **700–2,200 tok/s** depending on length (chunked, `max-num-batched-tokens
+4096`). A 25K-token prompt takes ~22 s to first token.
+
+### Speculative decoding: what helps, what does not
+
+Every one of these was measured on the workloads above, not reasoned about:
+
+| change | result |
+|---|---|
+| `draft_sample_method: greedy` (vs `probabilistic`) | **+1–3%**, and uses less GPU memory. Use it — it is also vLLM's default. |
+| `num_speculative_tokens: 10` | **−24% to −38% on every workload.** Do not. |
+| `num_speculative_tokens: 7` | **rejected at startup** — must be a multiple of `n_predict`. |
+| CUDA graphs (`PIECEWISE` or `FULL_AND_PIECEWISE`) | **`CUDA error: an illegal memory access`** — see below. |
+| `enable_adaptive_verification: true` | **impossible here** — it requires full CUDA graphs. |
+
+⚠️ **`num_speculative_tokens` must be a MULTIPLE of `dspark_block_size` (5)**, not merely
+≥ it. k=7 fails with `num_speculative_tokens:7 must be divisible by n_predict=5`.
+
+⚠️ **k=10 is much slower, and this is structural.** A spec step verifies k+1 tokens, and
+each token routes to its own 6-of-256 experts, so expert-weight traffic grows with the
+block. On a bandwidth-bound box that cost outruns the extra accepted tokens — acceptance
+per draft *falls* as well (counting drops 5.90 → 4.50). **k=5 is optimal. Deeper
+speculation is counterproductive on a sparse MoE.**
+
+## Context length: 32K is the honest ceiling on two boxes
+
+The checkpoint declares 1M (YaRN). vLLM will happily start at `--max-model-len 204800` and
+report a 1.27M-token KV pool. **It cannot serve it.** Weights are 94 GiB/rank of a 121.7 GiB
+unified pool (77%), and long-prefill working memory has nowhere to live:
+
+| max-model-len | prompt tested | host MemAvailable floor | result |
 |---|---:|---:|---|
-| eager, no spec | 13.0 tok/s | 1,499,162 @ 64K | SM ~91%, NVMe 2–3 MB/s |
-| **eager + DSpark k=5** | **16.7 tok/s** | 384,754 @ 32K | **+28%**; mean acceptance 2.18–2.44 of 5 |
-| CUDA graphs (+ either of the above) | — | — | **does not fit at TP=2** — see the memory section |
+| 32K | 25K tokens | **913 MB** | ✅ needle retrieved |
+| 64K | 35K tokens | 609 MB | ✅ needle retrieved |
+| 64K | ~62K tokens | **68 MB** | ✗ container killed |
+| 200K | ~150K tokens | 184 MB | ✗ container killed |
+| 200K | ~150K tokens (`max-num-batched-tokens 2048`) | — | ✗ **host wedged, power cycle** |
 
-Put that in context before you build this: **tonyd2wild's 4-box recipe reaches 24.9–92.2
-tok/s by workload category on the stock checkpoint.** Two boxes are meaningfully slower *and*
-lossier. This recipe is for people who have two boxes, not a recommendation over four.
+Smaller prefill chunks do **not** fix it, which says the growth is not in the chunk
+activations — the sparse-MLA indexer structures scale with context
+(`candidate_topk_blocks: 2048`, `index_topk: 512`).
 
-Prefill, Engram, and concurrency on this 2-box config are **not yet measured**.
-
-⚠️ DSpark needs `num_speculative_tokens` ≥ the checkpoint's `dspark_block_size` (**5**).
-Acceptance of 2.18–2.44 out of 5 is well below the ~5.37 the previous-generation
-DeepSeek-V4-Flash reached on its own drafter; whether that is the pruning, the
-configuration, or the model is **not established**.
-
+**Ship 32K.** It leaves a ~913 MB floor under load, roughly 3.6× the watchdog threshold.
+64K works for prompts up to ~40K but has no margin left for a full-length one.
 
 ## Why Engram on disk, and why `cpu_offload` is a trap
 
@@ -180,8 +222,24 @@ export HEAD_IP=<head-fabric-ip> IB_HCA=<your-hca> IB_GID=<your-gid> \
 ./dsv41-2xspark.sh 0      # on the head
 ```
 
-Defaults: `GMU=0.90 MAXLEN=32768 SEQS=8 EAGER=1 SPEC=dspark SPEC_K=5 PARSERS=1`.
-Cold start is ~8–12 min (weight load from cold page cache dominates).
+Defaults: `GMU=0.90 MAXLEN=32768 SEQS=8 EAGER=1 SPEC=dspark SPEC_K=5 PARSERS=1
+JIT_WARMUP=true CUTEDSL_WARMUP=true EXEC_TIMEOUT=1800`.
+
+Cold start is ~10–14 min. **Both warmups are on by default and they are what makes the
+lane survive a real workload** — they move Triton and CuTeDSL compilation out of the
+serving path, at the cost of a few minutes at boot. Do not turn them off to boot faster;
+see the `EngineDeadError` entry in Troubleshooting.
+
+This is the configuration this recipe recommends, and every part of it was A/B'd:
+
+| knob | value | why |
+|---|---|---|
+| `EAGER` | `1` | CUDA graphs crash with an illegal memory access (both modes) |
+| `SPEC_K` | `5` | must be a multiple of 5; k=10 is 24–38% slower |
+| `draft_sample_method` | `greedy` | +1–3% over `probabilistic`, less GPU memory |
+| `MAXLEN` | `32768` | 64K has no memory margin for a full-length prompt |
+| `GMU` | `0.90` | 0.86 leaves no room for KV at all; >0.91 trips vLLM's own check |
+| watchdog floor | `250 MB` | below the 1.5–2.0 GiB steady state and the ~500 MB warmup dip |
 
 ### `gpu-memory-utilization` has a narrow window
 
@@ -215,22 +273,29 @@ outside that bound**, and on unified memory "outside the bound" is also where th
 accepts, but `sshd` can no longer fork, and the OOM killer cannot reclaim CUDA mappings.
 Recovering means a power cycle.
 
-**Measured outcome: CUDA graphs are not usable at TP=2 with this checkpoint.** Capture at
-`GMU=0.90` (the only GMU that yields usable KV) starved both boxes into the unreachable
-state described above and required a power cycle. The correctness prerequisites — prestage
-Engram, exact capture sizes — were all in place; the wall is memory, not correctness.
+**Measured outcome: CUDA graphs are not usable at TP=2 with this checkpoint** — but the
+wall turned out to be *correctness*, not only memory. Both modes were tried at `GMU=0.90`
+with prestage Engram and exact DSpark capture sizes in place:
 
-What is left untested, in order of promise:
+| mode | capture sizes | result |
+|---|---|---|
+| `PIECEWISE` | 15 (multiples of k and k+1) | `CUDA error: an illegal memory access was encountered` |
+| `FULL_AND_PIECEWISE` | 8 (`SEQS=4`) | `CUDA error: an illegal memory access was encountered` |
 
-- `CUDAGRAPH_MODE=PIECEWISE` instead of `FULL_AND_PIECEWISE`. Piecewise does not capture
-  the attention op, so it needs less memory *and* cannot hit the padded-row problem at all.
-- Fewer capture sizes (`SEQS=2` → 4 graphs instead of 15).
-- A harder prune (K=192 ≈ 71 GiB/rank, matching the 4-box footprint) to buy back headroom,
-  at a real accuracy cost.
+Both died in `Worker_TP0` shortly after serving started, not at capture. This is consistent
+with the sm_120 sparse-MLA kernel receiving a batch shape it has no instantiation for — the
+same family as FlashInfer #5015 and the DSpark illegal-access seen on the 4× RTX PRO 6000
+box. **Reducing the capture set did not help**, so this is not the memory ceiling that an
+earlier revision of this file blamed.
 
-For now this recipe ships `EAGER=1`. On bandwidth-bound hardware that is a small loss —
-graphs were worth ~7% in the one eager/graphs A/B we got before the memory wall.
+⚠️ Consequence: **`enable_adaptive_verification` is unavailable on this hardware.** It is
+rejected at startup with *"Adaptive verification requires full CUDA graphs"*, and full
+graphs crash. Do not spend time on it.
 
+What is left untested: a harder prune (K=192 ≈ 71 GiB/rank, matching the 4-box footprint) to
+buy back headroom, at a real accuracy cost.
+
+**This recipe ships `EAGER=1`.** On bandwidth-bound hardware that is a small loss.
 
 ### Guard rails the launcher installs for you
 
@@ -240,10 +305,14 @@ graphs were worth ~7% in the one eager/graphs A/B we got before the memory wall.
   cannot start", and vLLM's own complaint about it arrives ~8 minutes later as a cryptic
   CUDA free-memory error. We lost a reboot to a GLM server that a `systemd` unit restarted
   at boot and quietly took 106 of 121 GB.
-- **With `EAGER=0` it arms `scripts/mem-watchdog.sh`**, which kills the container if
-  `MemAvailable` falls under 8 GiB. That is the difference between a failed experiment and
-  a power cycle — the kernel OOM killer cannot reclaim CUDA mappings, so without it the box
-  becomes unreachable and stays that way.
+- **It arms `scripts/mem-watchdog.sh`** (floor **250 MB**), which kills the container before
+  the host starves. That is the difference between a failed request and a power cycle — the
+  kernel OOM killer cannot reclaim CUDA mappings, so without it the box becomes unreachable.
+  Verified working: during an over-long prefill it fired at 115 MB and the host stayed up.
+  ⚠️ **Arm it in eager mode too**, not only with graphs — eager wedges the box just as
+  readily. ⚠️ **The floor must sit below the steady state (1.5–2.0 GiB) and below the
+  warmup dip (~500 MB)**; 8 GiB, this script's former default, kills every boot. And make
+  sure only one instance is running.
 
 ## Step 6 — verify, *then* benchmark
 
@@ -295,14 +364,57 @@ No reasoning parser. Both parsers register as **`deepseek_v41`**:
 The response field is **`reasoning`**, not `reasoning_content`. Thinking is ON by default —
 a smoke test that always sends `thinking: false` never exercises this path.
 
-### Draft blocks silently truncated
-`num_speculative_tokens` must be ≥ the checkpoint's `dspark_block_size` (**5**). Setting
-k=3 silently truncates the draft block and costs acceptance with no warning.
+### `num_speculative_tokens:7 must be divisible by n_predict=5`
+k must be a **multiple** of `dspark_block_size` (5), not merely ≥ it — so 5, 10, 15.
+k=5 is also the **fastest**: k=10 is 24–38% slower on every workload (see above).
 
 ### The box becomes unreachable (ping answers, SSH hangs)
 Unified memory: an over-commit starves the OS, and the OOM killer cannot reclaim CUDA
-mappings. `sshd` can no longer fork while ping keeps answering. The launcher passes
-`--memory 112g` and refuses to start below 100 GiB available; keep both.
+mappings. `sshd` can no longer fork while ping keeps answering; `:8033` (nginx) may still
+answer while `:8888` never binds. Sometimes it recovers after ~15 min, sometimes it needs a
+power cycle.
+
+⚠️ **This is NOT caused by CUDA graphs.** It reproduces with `--enforce-eager`. The cause is
+the memory working point itself: at GMU 0.90 the steady state leaves only **1.5–2.0 GiB**
+of host headroom, so anything extra — a long prefill, a mid-serve JIT compile — goes over.
+
+⚠️ **`--memory 112g --memory-swap 112g` made this worse, not better.** The intent (make the
+container the OOM victim instead of the host) is right, but a hard cgroup cap forces reclaim
+*inside* the cgroup against ~197 GB of mmap'd checkpoint shards, and the boot dies at the
+load→profile transition. The **memory watchdog is the mechanism that actually works**: it
+killed the container at 115 MB during an over-long prefill and the host stayed up.
+
+⚠️ **Set the watchdog floor at ~250 MB, not 8 GiB.** This lane's normal working point is
+1.5–2.0 GiB available and it legitimately dips to ~500 MB during warmup. A floor of 8 GiB
+kills the container on every boot; earlier revisions of `mem-watchdog.sh` shipped that
+default. Also make sure only **one** watchdog is running — a stale one from a previous
+experiment will fire at its own old floor.
+
+### One rank dies and the other hangs forever, with `/health` still returning 200
+If rank1's container goes away, rank0 blocks indefinitely on the shm broadcast
+(`No available shared memory broadcast block found in 60 seconds`) while the API server
+keeps answering `/health` with 200 and requests just never return. **Do not trust `/health`
+as a liveness check on this lane** — check that *both* containers are up.
+
+### `TimeoutError: RPC call to sample_tokens timed out` / `EngineDeadError` mid-serve
+The engine serves fine for a few minutes, then dies during a real workload. The worker log
+shows the cause just before it: **`Triton kernel JIT compilation during inference`** /
+**`CuTeDSL JIT compilation during inference`**, each warning *"causes a latency spike;
+consider extending warmup"*. The compile blows past the execute-model RPC deadline, or
+(worse) spikes memory while there is none left.
+
+**Fix — both warmups, plus the timeout:**
+
+```
+--kernel-config '{"enable_jit_warmup": true, "enable_cutedsl_warmup": true, ...}'
+-e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800
+```
+
+⚠️ **`enable_jit_warmup` covers Triton only.** CuTeDSL kernels (e.g.
+`MXFP8QuantizeSwizzledKernel`) are a separate warmup flag, and some of them are reached only
+on the **long-prefill** path — so short smoke tests will not expose them. Earlier revisions
+of this recipe disabled both warmups and set no timeout; that combination is the most likely
+explanation for the unexplained `EngineDeadError` this cluster carried for months.
 
 ### A second job OOM-kills the first
 Anything memory-hungry run next to the server (an upload that hashes hundreds of GB, a

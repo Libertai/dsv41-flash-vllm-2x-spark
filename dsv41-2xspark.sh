@@ -50,6 +50,7 @@ MPORT="${MPORT:-29801}"; PORT="${PORT:-8888}"
 GMU="${GMU:-0.90}"; MAXLEN="${MAXLEN:-32768}"; SEQS="${SEQS:-8}"; MAX_BATCHED="${MAX_BATCHED:-4096}"
 EAGER="${EAGER:-1}"; CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-FULL_AND_PIECEWISE}"; CG_SIZES="${CG_SIZES:-}"
 SPEC="${SPEC:-dspark}"; SPEC_K="${SPEC_K:-5}"
+JIT_WARMUP="${JIT_WARMUP:-true}"; EXEC_TIMEOUT="${EXEC_TIMEOUT:-1800}"
 ENGRAM_DISK="${ENGRAM_DISK:-1}"; TEXT_ONLY="${TEXT_ONLY:-1}"
 THINKING="${THINKING:-false}"; PARSERS="${PARSERS:-1}"
 VLLM_EXTRA="${VLLM_EXTRA:-}"; NCCL_EXTRA="${NCCL_EXTRA:-}"
@@ -98,14 +99,18 @@ if [ "$AVAIL_GB" -lt 100 ]; then
   exit 4
 fi
 
-# Arm the memory watchdog if we are about to change the memory envelope. CUDA-graph
-# capture allocates OUTSIDE the gpu-memory-utilization bound; without this, an overrun
-# starves the OS and the box needs a power cycle (ping answers, sshd cannot fork).
+# Arm the memory watchdog ALWAYS -- including eager mode. At 94 GiB/rank of a 121.7 GiB
+# unified pool the steady state leaves only ~1.5-2.0 GiB of host headroom, so a long
+# prefill or a mid-serve JIT compile can starve the OS even with --enforce-eager. Without
+# this the box needs a power cycle (ping answers, sshd cannot fork). Measured: it fired at
+# 115 MB during an over-long prefill and the host survived.
 WD="$(cd "$(dirname "$0")" && pwd)/scripts/mem-watchdog.sh"
-if [ "$EAGER" != "1" ] && [ "${WATCHDOG:-1}" = "1" ] && [ -x "$WD" ]; then
-  FLOOR_GB="${WATCHDOG_FLOOR_GB:-8}" setsid nohup "$WD" "$NAME" \
+if [ "${WATCHDOG:-1}" = "1" ] && [ -x "$WD" ]; then
+  # a stale watchdog from a previous run will fire at ITS old floor -- clear it first
+  pkill -f "$(basename "$WD") $NAME" 2>/dev/null || true
+  FLOOR_MB="${WATCHDOG_FLOOR_MB:-250}" setsid nohup "$WD" "$NAME" \
     >>"${WATCHDOG_LOG:-$HOME/mem-watchdog.log}" 2>&1 < /dev/null &
-  echo "mem-watchdog armed on $NAME (floor ${WATCHDOG_FLOOR_GB:-8} GiB)"
+  echo "mem-watchdog armed on $NAME (floor ${WATCHDOG_FLOOR_MB:-250} MB)"
 fi
 
 GRAPH_ENV=""
@@ -129,7 +134,7 @@ else
 fi
 if [ "$EAGER" = "1" ]; then SPEC_ADAPT=false; else SPEC_ADAPT="${SPEC_ADAPT:-false}"; fi
 if [ "$SPEC" = "dspark" ]; then
-  SPEC_ARGS="--speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":$SPEC_K,\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":$SPEC_ADAPT}"
+  SPEC_ARGS="--speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":$SPEC_K,\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":$SPEC_ADAPT}"
 else SPEC_ARGS=""; fi
 if [ "$TEXT_ONLY" = "1" ]; then TEXT_ARGS="--language-model-only"; else TEXT_ARGS=""; fi
 if [ "$PARSERS" = "1" ]; then PARSER_ARGS="--reasoning-parser deepseek_v41 --enable-auto-tool-choice --tool-call-parser deepseek_v41"; else PARSER_ARGS=""; fi
@@ -139,7 +144,7 @@ mkdir -p "$WORK/cache" "$WORK/fi-aot-empty"
 # shellcheck disable=SC2086
 exec docker run --rm --name "$NAME" \
   --runtime nvidia --gpus all \
-  --network host --ipc host --shm-size 32g --memory 112g --memory-swap 112g \
+  --network host --ipc host --shm-size 32g \
   --ulimit memlock=-1:-1 --cap-add IPC_LOCK --device /dev/infiniband:/dev/infiniband \
   --oom-score-adj 500 \
   -v "$WORK:/w" \
@@ -152,6 +157,7 @@ exec docker run --rm --name "$NAME" \
   -e HF_HOME=/w/cache/huggingface -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
   -e VLLM_CACHE_ROOT="/w/cache/vllm-$EXP_NAME" \
   -e VLLM_ENGINE_READY_TIMEOUT_S=3600 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${EXEC_TIMEOUT:-1800}" \
   -e VLLM_HAS_FLASHINFER_CUBIN=1 -e VLLM_DEEP_GEMM_WARMUP=skip -e PYTHONUNBUFFERED=1 \
   $ENGRAM_ENV $GRAPH_ENV \
   -e CUTE_DSL_ARCH=sm_121a -e TILELANG_CACHE_DIR=/w/tl-cache \
@@ -170,7 +176,7 @@ exec docker run --rm --name "$NAME" \
     --tensor-parallel-size 2 --gpu-memory-utilization "$GMU" --max-model-len "$MAXLEN" \
     --max-num-seqs "$SEQS" --max-num-batched-tokens "$MAX_BATCHED" \
     --engram-config '{"cpu_offload": false}' \
-    --kernel-config '{"enable_flashinfer_autotune": false, "enable_cutedsl_warmup": false, "enable_jit_warmup": false}' \
+    --kernel-config "{\"enable_flashinfer_autotune\": false, \"enable_cutedsl_warmup\": false, \"enable_jit_warmup\": ${JIT_WARMUP:-true}}" \
     --default-chat-template-kwargs "{\"thinking\": $THINKING}" \
     $TEXT_ARGS $PARSER_ARGS $SPEC_ARGS "${GRAPH_ARGS[@]}" \
     --distributed-executor-backend mp --nnodes 2 --node-rank "$NODE_RANK" \
