@@ -7,7 +7,7 @@ covers a whole verification step, so chunk-counting under-reports by the accept 
 
 usage: bench.py <base_url> <model> [reps]
 """
-import json, statistics, sys, time, urllib.request
+import json, statistics, sys, time, urllib.error, urllib.request
 
 BASE = sys.argv[1].rstrip("/"); MODEL = sys.argv[2]
 REPS = int(sys.argv[3]) if len(sys.argv) > 3 else 3
@@ -20,6 +20,13 @@ CASES = {
     "math":      "Compute the sum of the first 40 primes, showing each step.",
     "json":      "Emit a JSON array of 40 objects, each with id, name, and a three-word description.",
 }
+
+def guard(fn):
+    try:
+        return fn()
+    except urllib.error.URLError as e:
+        sys.exit(f"cannot reach {BASE}: {e.reason}\n"
+                 "if the engine is still loading it has not bound its port yet.")
 
 def run(prompt):
     body = {"model": MODEL, "prompt": prompt, "max_tokens": N, "min_tokens": N,
@@ -34,7 +41,7 @@ def run(prompt):
 print(f"{'category':<10} {'tok/s (median of ' + str(REPS) + ')':>24}")
 allv = []
 for name, prompt in CASES.items():
-    vals = [run(prompt) for _ in range(REPS)]
+    vals = [guard(lambda: run(prompt)) for _ in range(REPS)]
     med = statistics.median(vals)
     allv.append(med)
     print(f"{name:<10} {med:>24.1f}   (runs: {', '.join(f'{v:.1f}' for v in vals)})")

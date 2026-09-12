@@ -26,6 +26,16 @@ def post(path, body, timeout=300):
         return json.load(urllib.request.urlopen(req, timeout=timeout)), None
     except urllib.error.HTTPError as e:
         return None, e.read().decode()[:300]
+    except urllib.error.URLError as e:
+        # The single most likely failure: the engine is still loading (cold start is
+        # ~8-12 min and it binds the port only once startup completes).
+        print(f"\ncannot reach {BASE}: {e.reason}")
+        print("if the engine is still loading it has not bound its port yet -- wait for")
+        print("'Application startup complete' in the rank-0 log, then re-run.")
+        sys.exit(2)
+    except TimeoutError:
+        print(f"\ntimed out after {timeout}s against {BASE}")
+        sys.exit(2)
 
 def check(name, ok, detail=""):
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}{(' -- ' + detail) if detail else ''}")
