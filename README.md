@@ -235,6 +235,19 @@ For now this recipe ships `EAGER=1`. On bandwidth-bound hardware that is a small
 graphs were worth ~7% in the one eager/graphs A/B we got before the memory wall.
 
 
+### Guard rails the launcher installs for you
+
+- **It refuses to boot below 100 GiB `MemAvailable`** and, if something else is holding the
+  pool, prints the running containers and reminds you to check boot-persistent units. On
+  unified memory there is no second tier: "another model server is resident" means "this
+  cannot start", and vLLM's own complaint about it arrives ~8 minutes later as a cryptic
+  CUDA free-memory error. We lost a reboot to a GLM server that a `systemd` unit restarted
+  at boot and quietly took 106 of 121 GB.
+- **With `EAGER=0` it arms `scripts/mem-watchdog.sh`**, which kills the container if
+  `MemAvailable` falls under 8 GiB. That is the difference between a failed experiment and
+  a power cycle — the kernel OOM killer cannot reclaim CUDA mappings, so without it the box
+  becomes unreachable and stays that way.
+
 ## Step 6 — verify, *then* benchmark
 
 ```bash
@@ -298,6 +311,20 @@ mappings. `sshd` can no longer fork while ping keeps answering. The launcher pas
 Anything memory-hungry run next to the server (an upload that hashes hundreds of GB, a
 conversion job) will take it out. On a 120 GB unified box there is no headroom — run one
 thing at a time.
+
+## What's in here
+
+| file | what it does |
+|---|---|
+| `dsv41-2xspark.sh` | the launcher — run it on both boxes, worker first |
+| `Dockerfile` | serving image (vLLM nightly with `DeepseekV41ForCausalLM`) |
+| `patches/flashinfer-dsv41-sm120-tp2.patch` | sparse-MLA decode + prefill instantiations for topk 640/1152 at **32** heads (TP=2) |
+| `scripts/make-fipatch.sh` | extract the stock FlashInfer sources from the image and apply that patch |
+| `scripts/build-fi.sh` + `scripts/fi_build.py` | prebuild the patched module into a persistent cache, past the AOT `.so` that would otherwise shadow it |
+| `scripts/verify_serving.py` | **run this before any benchmark** — NaN/logprobs, known answer, default request shape, tool round trip |
+| `scripts/verify_shards.py` | each shard's declared extent vs its file size (catches a truncated download) |
+| `scripts/bench.py` | single-stream decode by workload category, counting usage tokens not SSE chunks |
+| `scripts/mem-watchdog.sh` | kills the container before the host starves; arm it for any memory-envelope experiment |
 
 ## Credits
 

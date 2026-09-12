@@ -83,7 +83,30 @@ fi
 docker rm -f "$NAME" 2>/dev/null || true
 sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 AVAIL_GB=$(( $(grep MemAvailable /proc/meminfo | awk '{print $2}') / 1048576 ))
-[ "$AVAIL_GB" -ge 100 ] || { echo "MemAvailable ${AVAIL_GB} GiB < 100 GiB, refusing to boot" >&2; exit 4; }
+if [ "$AVAIL_GB" -lt 100 ]; then
+  # The usual cause is another model server holding the pool. On unified memory there is
+  # no second tier, so "something else is resident" means "this cannot start" -- and the
+  # error vLLM would give you is a cryptic CUDA free-memory complaint 8 minutes later.
+  echo "MemAvailable ${AVAIL_GB} GiB < 100 GiB, refusing to boot" >&2
+  OTHERS=$(docker ps --format '{{.Names}}' | grep -v "^${NAME}$" || true)
+  if [ -n "$OTHERS" ]; then
+    echo "containers currently running (one of these is probably holding it):" >&2
+    docker ps --format '   {{.Names}}  {{.Image}}  {{.Status}}' | grep -v "  ${NAME}  " >&2
+    echo "also check for boot-persistent units that restart a model server:" >&2
+    echo "   systemctl list-unit-files --state=enabled | grep -iE 'vllm|sglang|stack'" >&2
+  fi
+  exit 4
+fi
+
+# Arm the memory watchdog if we are about to change the memory envelope. CUDA-graph
+# capture allocates OUTSIDE the gpu-memory-utilization bound; without this, an overrun
+# starves the OS and the box needs a power cycle (ping answers, sshd cannot fork).
+WD="$(cd "$(dirname "$0")" && pwd)/scripts/mem-watchdog.sh"
+if [ "$EAGER" != "1" ] && [ "${WATCHDOG:-1}" = "1" ] && [ -x "$WD" ]; then
+  FLOOR_GB="${WATCHDOG_FLOOR_GB:-8}" setsid nohup "$WD" "$NAME" \
+    >>"${WATCHDOG_LOG:-$HOME/mem-watchdog.log}" 2>&1 < /dev/null &
+  echo "mem-watchdog armed on $NAME (floor ${WATCHDOG_FLOOR_GB:-8} GiB)"
+fi
 
 GRAPH_ENV=""
 if [ "$EAGER" = "1" ]; then
