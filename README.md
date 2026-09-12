@@ -101,10 +101,11 @@ Verified in this stack:
 
 | | |
 |---|---|
-| vLLM | `0.1.1.dev16+gc191787a6` |
+| base image | `vllm/vllm-openai:nightly-e7edf17cea217e52701f913cd8491fcacf2d9490` |
+| vLLM | `0.1.1.dev16+gc191787a6` (wheel installed over the base) |
 | torch | `2.13.0+cu130` |
 | flashinfer | `0.6.18.post1` |
-| CUDA | 13.0 |
+| CUDA / python | 13.0.2 / 3.12.3 |
 
 ⚠️ Install the nightly **by URL**, not with `--pre`: the nightly calls itself `0.1.0`, so
 `pip install --pre vllm` silently prefers PyPI's release instead.
@@ -150,19 +151,15 @@ DSV4.1 mixes attention compress ratios, which gives sparse-MLA index widths of *
 different TP gets you the same crash.
 
 ```bash
-cd $WORK && mkdir -p fipatch && cd fipatch
-# extract the three stock files from the image, then:
-patch -p1 < ../../patches/flashinfer-dsv41-sm120-tp2.patch
+export WORK=$HOME/dsv41-work FIPATCH=$WORK/fipatch
+./scripts/make-fipatch.sh     # pulls the 3 stock files out of the image, applies the patch
+./scripts/build-fi.sh         # ~40 s; compiles and verifies the instantiation landed
 ```
 
-Then **prebuild it**, because patching the `.cu` alone does nothing:
-
-```bash
-WORK=$HOME/dsv41-work FIPATCH=$WORK/fipatch ./scripts/build-fi.sh     # ~40 s
-# verify the instantiation actually landed:
-nm -C $WORK/fi-cache/*/121a/cached_ops/sparse_mla_sm120/csrc_sparse_mla_sm120_decode_dsv4.cuda.o \
-  | grep -c 'sparse_mla_decode_dsv4_kernel<(ModelType)1, 32, 1152, 64>'
-```
+`build-fi.sh` finishes by running `nm` on the object and failing loudly if
+`sparse_mla_decode_dsv4_kernel<(ModelType)1, 32, 1152, 64>` is absent — do not skip that,
+because a build that silently produced the *old* kernel set looks identical until the
+engine refuses at profiling. Run both on **each** box.
 
 The wheel ships a **prebuilt AOT `sparse_mla_sm120.so`**, and `JitSpec.is_aot`
 short-circuits the JIT build before your source is read. `build-fi.sh` masks the AOT
